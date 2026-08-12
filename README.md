@@ -1,22 +1,41 @@
 # lolfix
 
-Detector e reparador de processos travados do **League of Legends** no macOS.
+Detect and fix stuck **League of Legends** processes on macOS.
 
-Resolve, sem reiniciar a máquina, o caso clássico do **botão "Jogar" que pisca e não abre nada** depois de um patch.
+Fixes the classic **"Play button flashes and nothing happens"** after a patch — without rebooting.
 
 ```bash
-lolfix              # detecta e lista — não altera nada
-lolfix --unstick    # destrava o cache de assinatura do kernel
-lolfix --fix        # kill + unstick + cache: a receita completa
+lolfix              # detect and list — changes nothing
+lolfix --unstick    # clear the kernel's stale code signature cache
+lolfix --fix        # kill + unstick + cache: the full recipe
 ```
 
 ---
 
-## O problema principal
+## Install
 
-Depois de um patch, você clica em **Jogar** no Riot Client, o botão fica cinza por um instante e volta ao normal. Nenhuma janela, nenhuma mensagem de erro. Reiniciar o Mac resolve — e é a única coisa que resolve.
+```bash
+curl -fsSL https://raw.githubusercontent.com/lucca-quintas-wh/lolfix-macos/main/install.sh | bash
+```
 
-O crash report do macOS mostra o que acontece de verdade:
+Or from a clone:
+
+```bash
+git clone https://github.com/lucca-quintas-wh/lolfix-macos.git
+cd lolfix-macos && ./install.sh
+```
+
+Installs to `~/.local/bin` by default. Override with `PREFIX=/usr/local/bin ./install.sh`. No dependencies beyond what ships with macOS.
+
+> The CLI's output is in Portuguese. Everything else — flags, docs, behavior — is English.
+
+---
+
+## The main problem
+
+After a patch, you click **Play** in the Riot Client. The button greys out for a moment, then resets. No window, no error message. Rebooting your Mac fixes it — and it's the only thing that does.
+
+The macOS crash report shows what's really happening:
 
 ```
 signal:        SIGKILL (Code Signature Invalid)
@@ -25,80 +44,68 @@ codeSigningID: ""
 procName:      LeagueClient
 ```
 
-O kernel do macOS mantém a assinatura de código de um binário **associada ao inode** do arquivo. Quando um patch reescreve o `LeagueClient`, o cache do kernel continua apontando para o conteúdo antigo. Toda tentativa de carregar o binário novo falha na validação e o processo é morto com `SIGKILL` antes de desenhar qualquer janela.
+The macOS kernel caches a binary's code signature **keyed to the file's inode**. When a patch rewrites `LeagueClient`, the kernel's cache still points at the old contents. Every attempt to load the new binary fails validation, and the process is killed with `SIGKILL` before it can draw a single window.
 
-Reiniciar funciona apenas porque esvazia esse cache.
+Rebooting works only because it flushes that cache.
 
-Isso explica o conjunto de sintomas que parece contraditório:
+This explains the set of symptoms that otherwise looks contradictory:
 
-| Sintoma | Causa |
+| Symptom | Cause |
 |---|---|
-| `codesign` diz `valid on disk`, mas o kernel mata o processo | disco íntegro, cache do kernel obsoleto |
-| Reboot resolve, reinstalar é desnecessário | o reboot só limpa o cache |
-| O botão reseta sem erro nenhum | o processo morre antes da primeira janela |
-| Limpar cache do cliente não adianta | é outro cache — do kernel, não do app |
+| `codesign` reports `valid on disk`, yet the kernel kills it | disk is fine, kernel cache is stale |
+| Reboot fixes it, reinstalling is unnecessary | the reboot only clears the cache |
+| The button resets with no error at all | the process dies before its first window |
+| Clearing the client's cache doesn't help | wrong cache — it's the kernel's, not the app's |
 
-### A correção
+### The fix
 
-Recriar o arquivo dá a ele um **inode novo**, forçando o kernel a reler a assinatura do zero:
+Recreating the file gives it a **new inode**, forcing the kernel to re-read the signature from scratch:
 
 ```bash
 lolfix --unstick
 ```
 
-Roda em 7 binários (`LeagueClient`, `LeagueClientUx`, os crash handlers, Chromium Embedded Framework, vivox, discord sdk). Usa `ditto` para preservar permissões, xattrs e ACLs, e um `mv` atômico por cima do original.
+It processes 7 binaries (`LeagueClient`, `LeagueClientUx`, both crash handlers, Chromium Embedded Framework, vivox, discord sdk). It uses `ditto` to preserve permissions, xattrs and ACLs, then an atomic `mv` over the original.
 
-O arquivo antigo **não pode** ficar dentro do bundle — qualquer sobra quebra o selo do code signing com `a sealed resource is missing or invalid`. Por isso a substituição é atômica, e ao final o `--unstick` verifica as assinaturas dos dois bundles, abortando com aviso se algo não bater.
+The old file **must not** be left inside the bundle — any leftover breaks the code signing seal with `a sealed resource is missing or invalid`. That's why the replacement is atomic, and why `--unstick` verifies both bundles' signatures at the end, aborting with a pointer to the Riot Repair Tool if anything fails to check out.
 
-Resultado medido: exit `137` (SIGKILL) → exit `0`, em execuções consecutivas sem novos crash reports.
-
----
-
-## Instalação
-
-```bash
-git clone https://github.com/lucca-quintas-wh/lolfix-macos.git
-cd lolfix-macos
-install -m 755 lolfix ~/.local/bin/lolfix
-```
-
-Certifique-se de que `~/.local/bin` está no seu `PATH`. Sem dependências além do que já vem no macOS.
+Measured result: exit `137` (SIGKILL) → exit `0`, across consecutive runs with no new crash reports.
 
 ---
 
-## Uso
+## Usage
 
-| Comando | O que faz |
+| Command | What it does |
 |---|---|
-| `lolfix` | Detecta e lista. **Somente leitura.** |
-| `lolfix --kill` / `-k` | Encerra os processos (`TERM`, depois `KILL -9` nos teimosos) |
-| `lolfix --unstick` / `-u` | Destrava o cache de assinatura do kernel. Substitui o reboot |
-| `lolfix --cache` / `-c` | Limpa caches e lockfiles do Riot/League |
+| `lolfix` | Detect and list. **Read-only.** |
+| `lolfix --kill` / `-k` | Terminate processes (`TERM`, then `KILL -9` for stragglers) |
+| `lolfix --unstick` / `-u` | Clear the kernel's code signature cache. Replaces the reboot |
+| `lolfix --cache` / `-c` | Clear Riot/League caches and lockfiles |
 | `lolfix --fix` / `-f` | `--kill` + `--unstick` + `--cache` |
-| `lolfix --reset-config` | Reseta as configurações do jogo (com backup automático) |
-| `lolfix -y` | Não pede confirmação |
-| `lolfix --help` / `-h` | Ajuda |
+| `lolfix --reset-config` | Reset in-game settings (backs up first) |
+| `lolfix -y` | Skip confirmation prompts |
+| `lolfix --help` / `-h` | Help |
 
-O modo padrão não altera nada: lista processos com PID/CPU/memória/tempo, mostra lockfiles pendentes e quanto cada diretório de cache está ocupando.
+The default mode changes nothing: it lists processes with PID/CPU/memory/uptime, shows pending lockfiles, and reports how much each cache directory is using.
 
-### Detecção
+### Detection
 
-Procura por `RiotClientServices`, `RiotClientUx`, `LeagueClient`, `LeagueCrashHandler`, `RiotClientCrashHandler`, Riot Repair Tool e o binário do jogo — deduplicando PIDs, com guarda para nunca matar a si mesmo nem o shell que o invocou.
+Matches `RiotClientServices`, `RiotClientUx`, `LeagueClient`, `LeagueCrashHandler`, `RiotClientCrashHandler`, the Riot Repair Tool, and the game binary itself — deduplicating PIDs, with guards so it never kills itself or the shell that invoked it.
 
-### Segurança
+### Safety
 
-- O modo padrão é read-only
-- Toda ação destrutiva pede confirmação (`-y` para pular)
-- `--cache` se recusa a rodar com o cliente aberto
-- `--reset-config` faz backup com timestamp antes de qualquer coisa
-- `--unstick` verifica as assinaturas ao final e aborta se algo não conferir
-- Sem confirmação possível (sem TTY), o script cancela em vez de prosseguir
+- Default mode is read-only
+- Every destructive action prompts for confirmation (`-y` to skip)
+- `--cache` refuses to run while the client is open
+- `--reset-config` takes a timestamped backup first
+- `--unstick` verifies signatures afterwards and aborts if they don't check out
+- With no TTY available to confirm, the script cancels rather than proceeding
 
 ---
 
-## Limpeza de cache
+## Cache cleanup
 
-`--cache` remove os diretórios abaixo, todos recriados automaticamente pelo cliente:
+`--cache` removes the directories below, all of which the client regenerates on its own:
 
 ```
 ~/Library/Application Support/Riot Client/{Cache,Code Cache,GPUCache,DawnCache,blob_storage}
@@ -107,27 +114,27 @@ Procura por `RiotClientServices`, `RiotClientUx`, `LeagueClient`, `LeagueCrashHa
 /Applications/League of Legends.app/Contents/LoL/Logs
 ```
 
-Mais os lockfiles que sobram quando o cliente morre de forma suja. Numa instalação com algum tempo de uso isso costuma passar de 600 MB.
+Plus the lockfiles left behind when the client dies uncleanly. On an installation with some mileage this routinely exceeds 600 MB.
 
 ---
 
-## Problema relacionado: "The application can't be opened"
+## Related problem: "The application can't be opened"
 
-Se abrir pelo ícone do Finder dá esse erro, é um problema **diferente** — o bundle externo está corrompido, sem `Contents/MacOS/` e sem `_CodeSignature`:
+If launching from the Finder icon gives you that error, it's a **different** problem — the outer bundle is corrupted, missing both `Contents/MacOS/` and `_CodeSignature`:
 
 ```
 Contents/
 ├── LoL/          ok
 ├── Resources/    ok
 ├── Info.plist    ok
-└── MacOS/        ausente
+└── MacOS/        missing
 ```
 
-Todo app do macOS precisa de `Contents/MacOS/<executável>`. Sem ele o LaunchServices desiste antes de rodar qualquer coisa, e a mensagem do Finder não diz o motivo.
+Every macOS app needs `Contents/MacOS/<executable>`. Without it, LaunchServices gives up before running anything, and the Finder's message doesn't say why.
 
-O `lolfix` **não conserta isso** — exigiria escrever dentro de um bundle assinado. As saídas são o **Riot Repair Tool** ou reinstalar o launcher.
+`lolfix` **does not fix this** — doing so would mean writing inside a signed bundle. Your options are the **Riot Repair Tool** or reinstalling the launcher.
 
-Enquanto isso, abra pelo Riot Client, que ignora a casca quebrada e vai direto no `LeagueClient.app` interno:
+In the meantime, launch through the Riot Client, which bypasses the broken shell and goes straight to the inner `LeagueClient.app`:
 
 ```bash
 open "/Users/Shared/Riot Games/Riot Client.app" --args \
@@ -136,16 +143,16 @@ open "/Users/Shared/Riot Games/Riot Client.app" --args \
 
 ---
 
-## Ressalvas
+## Caveats
 
-**A hipótese do inode foi confirmada empiricamente, não por documentação da Apple.** O comportamento bate de forma reprodutível (`137` → `0`), mas se um dia o `--unstick` não resolver, o reboot continua sendo o plano B garantido.
+**The inode hypothesis was confirmed empirically, not from Apple documentation.** The behavior reproduces consistently (`137` → `0`), but if `--unstick` ever fails to help, rebooting remains the guaranteed fallback.
 
-Os caminhos foram mapeados de uma instalação real. Se a Riot mudar a estrutura em algum patch grande, o script ignora o que não existe — não quebra, apenas limpa menos.
+Paths were mapped from a real installation. If Riot restructures things in a major patch, the script skips whatever isn't there — it won't break, it'll just clean less.
 
-Testado no macOS 26 (Darwin 25.6) em Apple Silicon (M4 Pro), com o `LeagueClient` rodando via Rosetta.
+Tested on macOS 26 (Darwin 25.6), Apple Silicon (M4 Pro), with `LeagueClient` running under Rosetta.
 
 ---
 
-## Licença
+## License
 
 MIT
