@@ -1,0 +1,420 @@
+#!/usr/bin/env bash
+#
+# lolfix - detector e limpador de processos travados do League of Legends / Riot Client (macOS)
+#
+# Uso:
+#   lolfix              detecta e lista processos (somente leitura, nao mexe em nada)
+#   lolfix --kill       encerra os processos encontrados (TERM, depois KILL nos teimosos)
+#   lolfix --cache      limpa os caches do Riot Client / LeagueClient
+#   lolfix --fix        --kill + --cache (a receita completa pro jogo voltar a abrir)
+#   lolfix --reset-config  reseta as configuracoes do jogo (faz backup antes)
+#   lolfix -y           nao pergunta confirmacao
+#   lolfix --help       mostra esta ajuda
+#
+
+set -uo pipefail
+
+# ---------------------------------------------------------------- cores
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'; BLUE=$'\033[34m'; RESET=$'\033[0m'
+else
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; RESET=""
+fi
+
+info()  { printf '%s\n' "$*"; }
+ok()    { printf '%s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn()  { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*"; }
+err()   { printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2; }
+head1() { printf '\n%s%s%s\n' "$BOLD" "$*" "$RESET"; }
+
+# ---------------------------------------------------------------- paths
+TILDE='~'   # usado nas substituicoes ${x/#$HOME/$TILDE}; literal escapado vira "\~"
+LOL_APP="/Applications/League of Legends.app"
+LOL_ROOT="$LOL_APP/Contents/LoL"
+RIOT_SHARED="/Users/Shared/Riot Games"
+APPSUP="$HOME/Library/Application Support"
+
+# Diretorios de cache: seguros de apagar, o cliente recria sozinho.
+CACHE_DIRS=(
+  "$APPSUP/Riot Client/Cache"
+  "$APPSUP/Riot Client/Code Cache"
+  "$APPSUP/Riot Client/GPUCache"
+  "$APPSUP/Riot Client/DawnCache"
+  "$APPSUP/Riot Client/blob_storage"
+  "$APPSUP/riot-client-ux/Cache"
+  "$APPSUP/riot-client-ux/Code Cache"
+  "$APPSUP/riot-client-ux/GPUCache"
+  "$APPSUP/riot-client-ux/DawnCache"
+  "$APPSUP/riot-client-ux/blob_storage"
+  "$APPSUP/com.riotgames.LeagueofLegends.LeagueClient/logs"
+  "$APPSUP/com.riotgames.LeagueofLegends.GameClient/logs"
+  "$LOL_ROOT/Logs"
+)
+
+# Arquivos de trava que sobram quando o cliente morre de forma suja.
+LOCK_FILES=(
+  "$LOL_ROOT/lockfile"
+  "$LOL_ROOT/LeagueClient.app/Contents/MacOS/lockfile"
+  "$RIOT_SHARED/com.riot.riotclient.checkinstalls-lock"
+  "$APPSUP/Riot Client/Cookies-journal"
+  "$APPSUP/riot-client-ux/Cookies-journal"
+)
+
+# Binarios que o League/Riot sobem. Casados contra a linha de comando completa.
+PATTERNS=(
+  "RiotClientServices"
+  "RiotClientUx"
+  "RiotClientCrashHandler"
+  "Riot Client.app"
+  "Riot Repair Tool"
+  "LeagueClient"
+  "LeagueCrashHandler"
+  "League of Legends.app"
+)
+
+# ---------------------------------------------------------------- detect
+# Preenche o array global FOUND_PIDS com os PIDs vivos, sem duplicar.
+FOUND_PIDS=()
+detect() {
+  FOUND_PIDS=()
+  local seen=" " pat pid
+  for pat in "${PATTERNS[@]}"; do
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      # nunca se auto-matar nem matar o shell que chamou
+      [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+      # ignora o proprio script caso apareca via pgrep -f
+      case "$(ps -p "$pid" -o command= 2>/dev/null)" in
+        *lolfix*) continue ;;
+      esac
+      case "$seen" in
+        *" $pid "*) continue ;;
+      esac
+      seen+="$pid "
+      FOUND_PIDS+=("$pid")
+    done < <(pgrep -f "$pat" 2>/dev/null)
+  done
+}
+
+show_processes() {
+  head1 "Processos do League of Legends / Riot Client"
+  if (( ${#FOUND_PIDS[@]} == 0 )); then
+    ok "Nenhum processo rodando."
+    return 1
+  fi
+  warn "${#FOUND_PIDS[@]} processo(s) encontrado(s):"
+  printf '\n%s%-8s %-6s %-6s %-9s %s%s\n' "$DIM" "PID" "CPU%" "MEM%" "TEMPO" "PROCESSO" "$RESET"
+  local pid
+  for pid in "${FOUND_PIDS[@]}"; do
+    ps -p "$pid" -o pid=,pcpu=,pmem=,etime=,comm= 2>/dev/null |
+      awk '{ printf "%-8s %-6s %-6s %-9s ", $1, $2, $3, $4
+             out=""; for (i=5; i<=NF; i++) out = out $i " "
+             n = split(out, parts, "/")
+             printf "%s\n", parts[n] }'
+  done
+  return 0
+}
+
+show_locks() {
+  head1 "Arquivos de trava (lockfiles)"
+  local f found=0
+  for f in "${LOCK_FILES[@]}"; do
+    if [[ -e "$f" ]]; then
+      warn "${f/#$HOME/$TILDE}"
+      found=1
+    fi
+  done
+  (( found == 0 )) && ok "Nenhum lockfile pendente."
+  return 0
+}
+
+# KB -> tamanho legivel. macOS nao tem numfmt, entao awk resolve.
+human() {
+  awk -v k="$1" 'BEGIN {
+    if (k >= 1048576) printf "%.1f GB", k/1048576
+    else if (k >= 1024) printf "%.1f MB", k/1024
+    else printf "%d KB", k
+  }'
+}
+
+show_cache_size() {
+  head1 "Cache ocupado"
+  local d total_kb=0 kb existing=0
+  for d in "${CACHE_DIRS[@]}"; do
+    [[ -d "$d" ]] || continue
+    existing=1
+    kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
+    [[ -z "$kb" ]] && kb=0
+    total_kb=$(( total_kb + kb ))
+    printf '  %s%9s%s  %s\n' "$DIM" "$(human "$kb")" "$RESET" "${d/#$HOME/$TILDE}"
+  done
+  if (( existing == 0 )); then
+    ok "Nenhum diretorio de cache presente."
+  else
+    printf '  %s%9s  total%s\n' "$BOLD" "$(human "$total_kb")" "$RESET"
+  fi
+}
+
+# ---------------------------------------------------------------- actions
+confirm() {
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  local reply
+  printf '%s%s%s [s/N] ' "$YELLOW" "$1" "$RESET"
+  read -r reply </dev/tty || return 1
+  [[ "$reply" =~ ^[sSyY]$ ]]
+}
+
+do_kill() {
+  detect
+  if (( ${#FOUND_PIDS[@]} == 0 )); then
+    ok "Nada para encerrar."
+    return 0
+  fi
+  show_processes
+  echo
+  confirm "Encerrar esses ${#FOUND_PIDS[@]} processo(s)?" || { info "Cancelado."; return 1; }
+
+  head1 "Encerrando"
+  local pid
+  # 1a passada: SIGTERM, deixa o processo fechar direito e salvar estado
+  for pid in "${FOUND_PIDS[@]}"; do
+    kill -TERM "$pid" 2>/dev/null && info "  TERM -> $pid"
+  done
+
+  # espera ate 5s pelos que ainda respiram
+  local waited=0
+  while (( waited < 5 )); do
+    local alive=0
+    for pid in "${FOUND_PIDS[@]}"; do
+      kill -0 "$pid" 2>/dev/null && alive=1
+    done
+    (( alive == 0 )) && break
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+
+  # 2a passada: SIGKILL nos teimosos
+  for pid in "${FOUND_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null && warn "  KILL -9 -> $pid (nao respondeu ao TERM)"
+    fi
+  done
+
+  sleep 1
+  detect
+  if (( ${#FOUND_PIDS[@]} == 0 )); then
+    ok "Todos os processos foram encerrados."
+  else
+    err "${#FOUND_PIDS[@]} processo(s) sobreviveram (provavelmente precisam de sudo):"
+    for pid in "${FOUND_PIDS[@]}"; do
+      info "    sudo kill -9 $pid   # $(ps -p "$pid" -o comm= 2>/dev/null)"
+    done
+    return 1
+  fi
+}
+
+do_cache() {
+  detect
+  if (( ${#FOUND_PIDS[@]} > 0 )); then
+    err "Ainda ha ${#FOUND_PIDS[@]} processo(s) rodando. Limpar cache com o cliente aberto nao adianta."
+    info "  Rode:  lolfix --fix"
+    return 1
+  fi
+
+  show_cache_size
+  echo
+  confirm "Apagar os caches acima? (o cliente recria sozinho no proximo boot)" || { info "Cancelado."; return 1; }
+
+  head1 "Limpando"
+  local d f removed=0
+  for d in "${CACHE_DIRS[@]}"; do
+    [[ -d "$d" ]] || continue
+    if rm -rf "$d" 2>/dev/null; then
+      ok "removido  ${d/#$HOME/$TILDE}"
+      removed=$(( removed + 1 ))
+    else
+      err "falhou    ${d/#$HOME/$TILDE}"
+    fi
+  done
+  for f in "${LOCK_FILES[@]}"; do
+    [[ -e "$f" ]] || continue
+    if rm -f "$f" 2>/dev/null; then
+      ok "lockfile  ${f/#$HOME/$TILDE}"
+      removed=$(( removed + 1 ))
+    fi
+  done
+  (( removed == 0 )) && info "Nada para remover." || ok "$removed item(ns) limpos."
+}
+
+do_reset_config() {
+  local cfg="$LOL_ROOT/Config"
+  if [[ ! -d "$cfg" ]]; then
+    warn "Config nao encontrado em $cfg"
+    return 1
+  fi
+  detect
+  if (( ${#FOUND_PIDS[@]} > 0 )); then
+    err "Feche o jogo antes (lolfix --kill)."
+    return 1
+  fi
+  head1 "Reset das configuracoes do jogo"
+  warn "Isso reseta keybinds, video e som para o padrao."
+  confirm "Continuar? (um backup sera criado ao lado)" || { info "Cancelado."; return 1; }
+
+  local backup="$cfg.backup-$(date +%Y%m%d-%H%M%S)"
+  if mv "$cfg" "$backup" 2>/dev/null; then
+    ok "Config resetado."
+    info "  Backup em: $backup"
+    info "  Para reverter: rm -rf \"$cfg\" && mv \"$backup\" \"$cfg\""
+  else
+    err "Nao consegui mover o Config (permissao?). Tente com sudo."
+    return 1
+  fi
+}
+
+# Lista os binarios Mach-O que o kernel valida na hora de carregar.
+unstick_targets() {
+  local app
+  for app in "$LOL_ROOT/LeagueClient.app" "$LOL_ROOT/League of Legends.app"; do
+    [[ -d "$app" ]] || continue
+    find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -u+x 2>/dev/null
+    find "$app/Contents/Frameworks" -maxdepth 2 -type f -perm -u+x 2>/dev/null
+  done
+}
+
+# Ha crash de assinatura recente? E o sintoma do cache preso.
+has_codesign_crash() {
+  local f
+  for f in $(find "$HOME/Library/Logs/DiagnosticReports" -iname "*League*.ips" -mtime -1 2>/dev/null); do
+    grep -q "CODESIGNING\|Code Signature Invalid" "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# O kernel guarda a assinatura de um binario amarrada ao inode. Quando um patch
+# reescreve o arquivo, o cache continua apontando pro conteudo antigo e toda
+# validacao nova falha com SIGKILL -- ate reiniciar a maquina.
+# Recriar o arquivo gera um inode novo e forca o kernel a reler a assinatura.
+do_unstick() {
+  detect
+  if (( ${#FOUND_PIDS[@]} > 0 )); then
+    err "Feche o cliente antes (lolfix --kill)."
+    return 1
+  fi
+
+  head1 "Destravando cache de assinatura do kernel"
+  if has_codesign_crash; then
+    warn "Crash de assinatura detectado nas ultimas 24h - e exatamente esse o problema."
+  else
+    info "${DIM}Nenhum crash recente de assinatura, mas seguindo mesmo assim.${RESET}"
+  fi
+
+  local bin dir n=0 fail=0
+  while IFS= read -r bin; do
+    [[ -n "$bin" ]] || continue
+    dir="$(dirname "$bin")"
+    # ditto preserva permissoes, xattrs e ACLs; o mv por cima e atomico
+    # (rename no mesmo diretorio) e desvincula o inode antigo sem deixar
+    # sobra dentro do bundle -- sobra quebraria o selo do code signing.
+    if ditto "$bin" "$dir/.lolfix.tmp" 2>/dev/null && mv -f "$dir/.lolfix.tmp" "$bin" 2>/dev/null; then
+      n=$(( n + 1 ))
+      printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$(basename "$bin")"
+    else
+      rm -f "$dir/.lolfix.tmp" 2>/dev/null
+      err "  falhou: $(basename "$bin")"
+      fail=$(( fail + 1 ))
+    fi
+  done < <(unstick_targets)
+
+  if (( n == 0 )); then
+    err "Nenhum binario processado."
+    return 1
+  fi
+  ok "$n binario(s) com inode novo."
+
+  head1 "Conferindo assinaturas"
+  local app bad=0
+  for app in "$LOL_ROOT/LeagueClient.app" "$LOL_ROOT/League of Legends.app"; do
+    [[ -d "$app" ]] || continue
+    if codesign --verify --strict "$app" 2>/dev/null; then
+      ok "$(basename "$app")"
+    else
+      err "$(basename "$app") - assinatura invalida"
+      bad=1
+    fi
+  done
+
+  if (( bad == 1 )); then
+    err "Alguma assinatura nao confere. Use o Riot Repair Tool."
+    return 1
+  fi
+  (( fail > 0 )) && warn "$fail binario(s) nao puderam ser recriados (permissao?)."
+  ok "Pronto. Clique em Jogar - nao precisa reiniciar."
+}
+
+usage() {
+  cat <<EOF
+${BOLD}lolfix${RESET} - detector de processos travados do League of Legends (macOS)
+
+${BOLD}USO${RESET}
+  lolfix                  Detecta e lista. Nao altera nada.
+  lolfix --kill    | -k   Encerra os processos (TERM, depois KILL).
+  lolfix --unstick | -u   Destrava o cache de assinatura do kernel.
+                          Substitui o reboot quando o "Jogar" nao faz nada.
+  lolfix --cache   | -c   Limpa caches e lockfiles do Riot/League.
+  lolfix --fix     | -f   --kill + --unstick + --cache. A receita completa.
+  lolfix --reset-config   Reseta as configuracoes do jogo (com backup).
+  lolfix -y               Nao pede confirmacao.
+  lolfix --help    | -h   Esta ajuda.
+
+${BOLD}O BOTAO "JOGAR" PISCA E NAO ABRE NADA${RESET}
+  Depois de um patch, o kernel fica com a assinatura antiga do LeagueClient
+  em cache e mata o processo novo com SIGKILL. Reiniciar resolve -- e isto
+  tambem, sem reboot:
+      lolfix --unstick
+
+${BOLD}ABRIR O JOGO${RESET}
+  open "$RIOT_SHARED/Riot Client.app" --args \\
+       --launch-product=league_of_legends --launch-patchline=live
+EOF
+}
+
+# ---------------------------------------------------------------- main
+ASSUME_YES=0
+ACTION="detect"
+
+while (( $# > 0 )); do
+  case "$1" in
+    -k|--kill)      ACTION="kill" ;;
+    -c|--cache)     ACTION="cache" ;;
+    -u|--unstick)   ACTION="unstick" ;;
+    -f|--fix|--all) ACTION="fix" ;;
+    --reset-config) ACTION="reset-config" ;;
+    -y|--yes)       ASSUME_YES=1 ;;
+    -h|--help)      usage; exit 0 ;;
+    *) err "Opcao desconhecida: $1"; echo; usage; exit 2 ;;
+  esac
+  shift
+done
+
+case "$ACTION" in
+  detect)
+    detect
+    show_processes
+    running=$?
+    show_locks
+    show_cache_size
+    echo
+    if (( running == 0 )); then
+      info "${BOLD}Proximo passo:${RESET} lolfix --fix"
+    else
+      info "${DIM}Tudo limpo. Se o jogo ainda nao abrir: lolfix --cache${RESET}"
+    fi
+    ;;
+  kill)         do_kill ;;
+  cache)        do_cache ;;
+  unstick)      do_unstick ;;
+  fix)          do_kill; echo; do_unstick; echo; do_cache ;;
+  reset-config) do_reset_config ;;
+esac
