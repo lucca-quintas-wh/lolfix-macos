@@ -29,8 +29,16 @@ die()  { printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 [[ "$(uname -s)" == "Darwin" ]] || die "lolfix is macOS-only (found $(uname -s))."
 
 # Source: the file next to this script when cloned, otherwise fetch it.
+#
+# BASH_SOURCE is only set when bash reads the script from a real file. Piped
+# through `curl | bash` it is unset and $0 is just "bash", so falling back to
+# $0 would resolve to the current directory -- and silently install whatever
+# file named "lolfix" happened to be sitting there. Require BASH_SOURCE.
 SRC=""
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
+SELF_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+fi
 if [[ -n "$SELF_DIR" && -f "$SELF_DIR/lolfix" ]]; then
   SRC="$SELF_DIR/lolfix"
   printf '%sInstalling from local clone.%s\n' "$DIM" "$RESET"
