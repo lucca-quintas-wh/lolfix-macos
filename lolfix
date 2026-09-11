@@ -5,8 +5,9 @@
 # Uso:
 #   lolfix              detecta e lista processos (somente leitura, nao mexe em nada)
 #   lolfix --kill       encerra os processos encontrados (TERM, depois KILL nos teimosos)
+#   lolfix --unstick    destrava o cache de assinatura do kernel (troca o reboot)
 #   lolfix --cache      limpa os caches do Riot Client / LeagueClient
-#   lolfix --fix        --kill + --cache (a receita completa pro jogo voltar a abrir)
+#   lolfix --fix        --kill + --cache + --unstick (a receita completa pro jogo voltar a abrir)
 #   lolfix --reset-config  reseta as configuracoes do jogo (faz backup antes)
 #   lolfix -y           nao pergunta confirmacao
 #   lolfix --help       mostra esta ajuda
@@ -273,23 +274,96 @@ do_reset_config() {
   fi
 }
 
-# Lista os binarios Mach-O que o kernel valida na hora de carregar.
-unstick_targets() {
-  local app
-  for app in "$LOL_ROOT/LeagueClient.app" "$LOL_ROOT/League of Legends.app"; do
-    [[ -d "$app" ]] || continue
-    find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -u+x 2>/dev/null
-    find "$app/Contents/Frameworks" -maxdepth 2 -type f -perm -u+x 2>/dev/null
+# ---------------------------------------------------------------- unstick
+UX_APP="$LOL_ROOT/League of Legends.app"
+GAME_APP="$LOL_ROOT/Game/LeagueofLegends.app"
+RIOT_APP="$RIOT_SHARED/Riot Client.app"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/lolfix"
+STAMP="$STATE_DIR/unstick.stamp"   # ctime = ultimo --unstick que deu certo
+
+# Bundles cujos binarios o patch reescreve. $1=1 inclui o Riot Client
+# (so quando ele esta fechado).
+unstick_bundles() {
+  local b
+  for b in "$LOL_ROOT/LeagueClient.app" "$UX_APP" "$GAME_APP"; do
+    [[ -d "$b" ]] && printf '%s\n' "$b"
   done
+  [[ "${1:-0}" == "1" && -d "$RIOT_APP" ]] && printf '%s\n' "$RIOT_APP"
+  return 0
+}
+
+is_macho() {
+  case "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" in
+    cafebabe|feedfacf|cffaedfe|feedface|cefaedfe) return 0 ;;
+  esac
+  return 1
+}
+
+# Todo Mach-O dos bundles, em qualquer profundidade. Os helpers do CEF ficam em
+# Frameworks/LeagueClientUx Helper (GPU).app/Contents/MacOS -- se o GPU helper
+# fica com a assinatura velha em cache, o kernel mata ele (exit 9) e a interface
+# do cliente morre com "UX process failed to start (exit code 5)".
+unstick_targets() {
+  local bundle f
+  while IFS= read -r bundle; do
+    while IFS= read -r -d '' f; do
+      is_macho "$f" && printf '%s\n' "$f"
+    done < <(find "$bundle/Contents" -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.so' \) -print0 2>/dev/null)
+  done < <(unstick_bundles "${1:-0}")
+}
+
+# Binarios do League reescritos depois do ultimo --unstick (patch novo).
+stale_targets() {
+  local since=0 f
+  [[ -f "$STAMP" ]] && since=$(stat -f %c "$STAMP")
+  while IFS= read -r f; do
+    (( $(stat -f %c "$f" 2>/dev/null || echo 0) > since )) && printf '%s\n' "$f"
+  done < <(unstick_targets 0)
+  return 0
+}
+
+# PIDs do cliente/jogo em si. Riot Client e o LeagueCrashHandler que fica
+# sobrando nao contam: trocar o inode por baixo deles e inofensivo.
+league_pids() {
+  ps -axo pid=,comm= | awk '{
+    pid = $1; sub(/^ *[0-9]+ +/, "")
+    n = split($0, p, "/")
+    if (p[n] ~ /^(LeagueClient|LeagueClientUx|LeagueClientUx Helper.*|LeagueofLegends)$/) print pid
+  }'
+}
+
+riot_client_running() {
+  pgrep -f "RiotClientServices" >/dev/null 2>&1
 }
 
 # Ha crash de assinatura recente? E o sintoma do cache preso.
 has_codesign_crash() {
   local f
-  for f in $(find "$HOME/Library/Logs/DiagnosticReports" -iname "*League*.ips" -mtime -1 2>/dev/null); do
+  while IFS= read -r f; do
     grep -q "CODESIGNING\|Code Signature Invalid" "$f" 2>/dev/null && return 0
-  done
+  done < <(find "$HOME/Library/Logs/DiagnosticReports" -iname "*League*.ips" -mtime -1 2>/dev/null)
+  # helper do CEF morto pelo kernel nao gera .ips; aparece como GPU saindo com 9 (SIGKILL)
+  local ux="$HOME/Library/Logs/LeagueClientUx_debug.log"
+  [[ -n "$(find "$ux" -mtime -1 2>/dev/null)" ]] && grep -q "exit_code=9" "$ux" 2>/dev/null && return 0
   return 1
+}
+
+show_stale() {
+  head1 "Cache de assinatura do kernel"
+  STALE=0
+  if [[ ! -f "$STAMP" ]]; then
+    warn "Nenhum --unstick registrado ainda."
+    STALE=1
+    return 0
+  fi
+  local n
+  n=$(stale_targets | wc -l | tr -d ' ')
+  if (( n > 0 )); then
+    warn "$n binario(s) reescritos por patch depois do ultimo --unstick."
+    STALE=1
+  else
+    ok "Nenhum patch desde o ultimo --unstick ($(stat -f '%Sc' -t '%d/%m %H:%M' "$STAMP"))."
+  fi
 }
 
 # O kernel guarda a assinatura de um binario amarrada ao inode. Quando um patch
@@ -297,11 +371,14 @@ has_codesign_crash() {
 # validacao nova falha com SIGKILL -- ate reiniciar a maquina.
 # Recriar o arquivo gera um inode novo e forca o kernel a reler a assinatura.
 do_unstick() {
-  detect
-  if (( ${#FOUND_PIDS[@]} > 0 )); then
-    err "Feche o cliente antes (lolfix --kill)."
+  local pids
+  pids=$(league_pids)
+  if [[ -n "$pids" ]]; then
+    err "O League esta aberto (PID $(echo $pids)). Feche o cliente antes (lolfix --kill)."
     return 1
   fi
+  local with_rc=1
+  riot_client_running && with_rc=0
 
   head1 "Destravando cache de assinatura do kernel"
   if has_codesign_crash; then
@@ -309,8 +386,12 @@ do_unstick() {
   else
     info "${DIM}Nenhum crash recente de assinatura, mas seguindo mesmo assim.${RESET}"
   fi
+  if (( with_rc == 0 )); then
+    info "${DIM}Riot Client aberto: os binarios dele ficam de fora. Espere o download do patch terminar antes.${RESET}"
+  fi
 
-  local bin dir n=0 fail=0
+  local bin dir n=0 fail=0 bad=0
+  local -a done_bins=()
   while IFS= read -r bin; do
     [[ -n "$bin" ]] || continue
     dir="$(dirname "$bin")"
@@ -319,38 +400,49 @@ do_unstick() {
     # sobra dentro do bundle -- sobra quebraria o selo do code signing.
     if ditto "$bin" "$dir/.lolfix.tmp" 2>/dev/null && mv -f "$dir/.lolfix.tmp" "$bin" 2>/dev/null; then
       n=$(( n + 1 ))
-      printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$(basename "$bin")"
+      done_bins+=("$bin")
     else
       rm -f "$dir/.lolfix.tmp" 2>/dev/null
-      err "  falhou: $(basename "$bin")"
+      err "  falhou: ${bin#"$LOL_ROOT/"}"
       fail=$(( fail + 1 ))
     fi
-  done < <(unstick_targets)
+  done < <(unstick_targets "$with_rc")
 
   if (( n == 0 )); then
     err "Nenhum binario processado."
     return 1
   fi
-  ok "$n binario(s) com inode novo."
 
-  head1 "Conferindo assinaturas"
-  local app bad=0
-  for app in "$LOL_ROOT/LeagueClient.app" "$LOL_ROOT/League of Legends.app"; do
-    [[ -d "$app" ]] || continue
-    if codesign --verify --strict "$app" 2>/dev/null; then
-      ok "$(basename "$app")"
-    else
-      err "$(basename "$app") - assinatura invalida"
-      bad=1
-    fi
-  done
+  # Resumo por bundle + conferencia binario a binario. --ignore-resources porque
+  # o jogo e o Riot Client ja vem da Riot com o selo de recursos incompleto;
+  # o que o kernel checa ao executar e a assinatura do proprio Mach-O.
+  local bundle count out
+  while IFS= read -r bundle; do
+    count=0
+    for bin in "${done_bins[@]}"; do
+      [[ "$bin" == "$bundle/"* ]] || continue
+      count=$(( count + 1 ))
+      # dylibs so com assinatura de linker (libEGL etc do CEF) vem assim da Riot;
+      # quem garante elas e o selo do framework. Nao ha o que conferir.
+      if ! out=$(codesign --verify --strict --ignore-resources "$bin" 2>&1) &&
+         [[ "$out" != *"not signed at all"* ]]; then
+        err "  assinatura invalida: ${bin#"$bundle/"}"
+        bad=1
+      fi
+    done
+    printf '  %s✓%s %-22s %s binario(s)\n' "$GREEN" "$RESET" "$(basename "$bundle")" "$count"
+  done < <(unstick_bundles "$with_rc")
+  ok "$n binario(s) com inode novo."
 
   if (( bad == 1 )); then
     err "Alguma assinatura nao confere. Use o Riot Repair Tool."
     return 1
   fi
   (( fail > 0 )) && warn "$fail binario(s) nao puderam ser recriados (permissao?)."
+  mkdir -p "$STATE_DIR" && touch "$STAMP"
   ok "Pronto. Clique em Jogar - nao precisa reiniciar."
+  info "${DIM}Se o Riot Client baixar outro patch antes do Jogar, rode lolfix --unstick de novo"
+  info "(pode ser com o Riot Client aberto).${RESET}"
 }
 
 usage() {
@@ -362,8 +454,9 @@ ${BOLD}USO${RESET}
   lolfix --kill    | -k   Encerra os processos (TERM, depois KILL).
   lolfix --unstick | -u   Destrava o cache de assinatura do kernel.
                           Substitui o reboot quando o "Jogar" nao faz nada.
+                          Funciona com o Riot Client aberto.
   lolfix --cache   | -c   Limpa caches e lockfiles do Riot/League.
-  lolfix --fix     | -f   --kill + --unstick + --cache. A receita completa.
+  lolfix --fix     | -f   --kill + --cache + --unstick. A receita completa.
   lolfix --reset-config   Reseta as configuracoes do jogo (com backup).
   lolfix -y               Nao pede confirmacao.
   lolfix --help    | -h   Esta ajuda.
@@ -373,6 +466,10 @@ ${BOLD}O BOTAO "JOGAR" PISCA E NAO ABRE NADA${RESET}
   em cache e mata o processo novo com SIGKILL. Reiniciar resolve -- e isto
   tambem, sem reboot:
       lolfix --unstick
+
+  O unstick precisa ser DEPOIS do ultimo patch. Se o Riot Client atualizar
+  o jogo, espere o download terminar, rode lolfix --unstick e so entao Jogar.
+  O lolfix sem argumentos avisa quando houve patch desde o ultimo unstick.
 
 ${BOLD}ABRIR O JOGO${RESET}
   open "$RIOT_SHARED/Riot Client.app" --args \\
@@ -405,9 +502,15 @@ case "$ACTION" in
     running=$?
     show_locks
     show_cache_size
+    show_stale
     echo
-    if (( running == 0 )); then
+    if (( running == 0 )) && [[ -n "$(league_pids)" ]]; then
       info "${BOLD}Proximo passo:${RESET} lolfix --fix"
+    elif (( STALE == 1 )); then
+      info "${BOLD}Proximo passo:${RESET} lolfix --unstick"
+    elif (( running == 0 )); then
+      info "${BOLD}Riot Client aberto e binarios em dia:${RESET} pode clicar em Jogar."
+      info "${DIM}Se ainda nao abrir: lolfix --fix${RESET}"
     else
       info "${DIM}Tudo limpo. Se o jogo ainda nao abrir: lolfix --cache${RESET}"
     fi
@@ -415,6 +518,7 @@ case "$ACTION" in
   kill)         do_kill ;;
   cache)        do_cache ;;
   unstick)      do_unstick ;;
-  fix)          do_kill; echo; do_unstick; echo; do_cache ;;
+  # unstick por ultimo: e o passo que precisa ver os binarios na versao final
+  fix)          do_kill; echo; do_cache; echo; do_unstick ;;
   reset-config) do_reset_config ;;
 esac

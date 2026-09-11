@@ -7,7 +7,7 @@ Fixes the classic **"Play button flashes and nothing happens"** after a patch �
 ```bash
 lolfix              # detect and list — changes nothing
 lolfix --unstick    # clear the kernel's stale code signature cache
-lolfix --fix        # kill + unstick + cache: the full recipe
+lolfix --fix        # kill + cache + unstick: the full recipe
 ```
 
 ---
@@ -65,9 +65,15 @@ Recreating the file gives it a **new inode**, forcing the kernel to re-read the 
 lolfix --unstick
 ```
 
-It processes 7 binaries (`LeagueClient`, `LeagueClientUx`, both crash handlers, Chromium Embedded Framework, vivox, discord sdk). It uses `ditto` to preserve permissions, xattrs and ACLs, then an atomic `mv` over the original.
+It processes every Mach-O binary in the League bundles, at any depth — 20 of them: `LeagueClient`, `LeagueClientUx`, Chromium Embedded Framework and its dylibs, the CEF helper apps (`LeagueClientUx Helper`, `(GPU)`, `(Renderer)`), vivox, discord sdk, the crash handlers, and the game itself (`Game/LeagueofLegends.app`). The Riot Client's own binaries are included when it's closed. It uses `ditto` to preserve permissions, xattrs and ACLs, then an atomic `mv` over the original.
 
-The old file **must not** be left inside the bundle — any leftover breaks the code signing seal with `a sealed resource is missing or invalid`. That's why the replacement is atomic, and why `--unstick` verifies both bundles' signatures at the end, aborting with a pointer to the Riot Repair Tool if anything fails to check out.
+The helpers matter: if only `LeagueClient` is refreshed, the backend starts but the kernel kills the stale GPU helper (`GPU process exited unexpectedly: exit_code=9` in `~/Library/Logs/LeagueClientUx_debug.log`), and the client dies with `UX process failed to start (exit code 5)`.
+
+The old file **must not** be left inside the bundle — any leftover breaks the code signing seal with `a sealed resource is missing or invalid`. That's why the replacement is atomic, and why `--unstick` verifies every binary's signature at the end, aborting with a pointer to the Riot Repair Tool if anything fails to check out. (Verification is per binary rather than per bundle because Riot ships the game and Riot Client bundles with incomplete resource seals.)
+
+### Timing: unstick after the last patch
+
+`--unstick` only helps if it runs **after** the patch lands. If the Riot Client downloads an update after you unstick, the new binaries are stale again. It works with the Riot Client open, so the reliable sequence is: open the Riot Client, let the update finish, run `lolfix --unstick`, click **Play**. The default `lolfix` mode tells you when binaries were rewritten since the last successful unstick.
 
 Measured result: exit `137` (SIGKILL) → exit `0`, across consecutive runs with no new crash reports.
 
@@ -79,14 +85,14 @@ Measured result: exit `137` (SIGKILL) → exit `0`, across consecutive runs with
 |---|---|
 | `lolfix` | Detect and list. **Read-only.** |
 | `lolfix --kill` / `-k` | Terminate processes (`TERM`, then `KILL -9` for stragglers) |
-| `lolfix --unstick` / `-u` | Clear the kernel's code signature cache. Replaces the reboot |
+| `lolfix --unstick` / `-u` | Clear the kernel's code signature cache. Replaces the reboot. Works with the Riot Client open |
 | `lolfix --cache` / `-c` | Clear Riot/League caches and lockfiles |
-| `lolfix --fix` / `-f` | `--kill` + `--unstick` + `--cache` |
+| `lolfix --fix` / `-f` | `--kill` + `--cache` + `--unstick` (unstick last) |
 | `lolfix --reset-config` | Reset in-game settings (backs up first) |
 | `lolfix -y` | Skip confirmation prompts |
 | `lolfix --help` / `-h` | Help |
 
-The default mode changes nothing: it lists processes with PID/CPU/memory/uptime, shows pending lockfiles, and reports how much each cache directory is using.
+The default mode changes nothing: it lists processes with PID/CPU/memory/uptime, shows pending lockfiles, reports how much each cache directory is using, and warns if a patch rewrote any binary since the last `--unstick`.
 
 ### Detection
 
@@ -98,7 +104,7 @@ Matches `RiotClientServices`, `RiotClientUx`, `LeagueClient`, `LeagueCrashHandle
 - Every destructive action prompts for confirmation (`-y` to skip)
 - `--cache` refuses to run while the client is open
 - `--reset-config` takes a timestamped backup first
-- `--unstick` verifies signatures afterwards and aborts if they don't check out
+- `--unstick` refuses to run while League itself is open, and verifies signatures afterwards, aborting if they don't check out
 - With no TTY available to confirm, the script cancels rather than proceeding
 
 ---
